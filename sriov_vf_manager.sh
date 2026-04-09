@@ -1,33 +1,61 @@
 #!/bin/bash
 set -e
 
+# 安装目标目录
 CONFIG_DIR="/etc/sriov_vf"
 BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 
-CONFIG_FILE_NAME="config.yaml"
+# 安装时涉及的文件名
+CONFIG_FILE_NAME="config.ini"
 SCRIPT_FILE_NAME="sriov_vf.sh"
 SERVICE_FILE_NAME="sriov_vf.service"
 
+# 安装后的完整路径
 CONFIG_PATH="$CONFIG_DIR/$CONFIG_FILE_NAME"
 SCRIPT_PATH="$BIN_DIR/$SCRIPT_FILE_NAME"
 SERVICE_PATH="$SYSTEMD_DIR/$SERVICE_FILE_NAME"
 SERVICE_NAME="$SERVICE_FILE_NAME"
 
+# 安装清单：源文件名|目标目录|目标路径|权限
 INSTALL_ITEMS=(
     "$CONFIG_FILE_NAME|$CONFIG_DIR|$CONFIG_PATH|644"
     "$SCRIPT_FILE_NAME|$BIN_DIR|$SCRIPT_PATH|755"
     "$SERVICE_FILE_NAME|$SYSTEMD_DIR|$SERVICE_PATH|644"
 )
 
+# 运行脚本依赖的软件包
 PACKAGE_ITEMS=(
     "ethtool"
     "lshw"
+    "linux-cpupower"
+)
+
+# 全局配置默认值
+GLOBAL_CPU_GOVERNOR_DEFAULT="powersave"
+
+# 结构化全局配置询问项：
+# 提示文本|变量名|可选项列表|默认值|确认方式(0|no|yes)
+GLOBAL_CONFIG_ITEMS=(
+    "请选择 CPU governor，用于 cpupower 设置|cpu_governor|powersave/schedutil|powersave|0"
+)
+
+# 结构化网卡配置询问项：
+# 提示文本|变量名|可选项列表|默认值|确认方式(0|no|yes)
+VF_SELECT_CONFIG_ITEMS=(
+    "请选择网卡|iface|__IFACE_OPTIONS__||0"
+)
+
+VF_COMMON_CONFIG_ITEMS=(
+    "请输入 VF 数量|vf_count||__VF_COUNT_DEFAULT__|0"
+    "是否启用调优|tuned|true/false|__TUNED_DEFAULT__|0"
+    "请输入基础 MAC|base_mac||__BASE_MAC_DEFAULT__|0"
 )
 
 # ========================
 # 工具函数
 # ========================
+# 要求以 root 运行，避免安装和 systemd 操作失败
 require_root() {
     if [ "$EUID" -ne 0 ]; then
         echo "请使用 root 运行"
@@ -35,10 +63,12 @@ require_root() {
     fi
 }
 
+# 简单暂停，便于查看当前输出
 pause() {
     read -p "按回车继续..."
 }
 
+# 主标题，同时负责清屏
 header() {
     clear
     echo "=============================="
@@ -46,11 +76,29 @@ header() {
     echo "=============================="
 }
 
+# 子页面标题：在主标题下显示当前功能名
 subheader() {
     header
     echo "---- $1 ----"
 }
 
+# 使用 / 拼接数组，便于写入结构化可选项列表
+join_by_slash() {
+    local joined=""
+    local item
+
+    for item in "$@"; do
+        if [ -z "$joined" ]; then
+            joined="$item"
+        else
+            joined="$joined/$item"
+        fi
+    done
+
+    printf '%s\n' "$joined"
+}
+
+# 检查并安装缺失依赖
 install_packages() {
     local missing_packages=()
     local package_name
@@ -83,6 +131,7 @@ install_packages() {
     fi
 }
 
+# 根据用户输入决定是否卸载依赖
 uninstall_packages() {
     local remove_choice
 
@@ -111,40 +160,41 @@ uninstall_packages() {
     esac
 }
 
+# 首次使用时生成最小 ini 配置骨架
 ensure_config_file() {
     if [ ! -f "$CONFIG_PATH" ]; then
         mkdir -p "$CONFIG_DIR"
         cat <<'EOF' > "$CONFIG_PATH"
-vfs:
+; /etc/sriov_vf/config.ini
 EOF
     fi
 }
 
-get_next_vf_id() {
-    local ids=()
-    local expected_id=0
-    local current_id
+# 去掉配置值两侧可能存在的引号
+strip_config_quotes() {
+    local value="$1"
 
-    ensure_config_file
-    mapfile -t ids < <(awk '/^[[:space:]]+id:/ {print $2}' "$CONFIG_PATH" | sort -n)
+    if [[ "$value" =~ ^\".*\"$ ]]; then
+        value="${value:1:${#value}-2}"
+    elif [[ "$value" =~ ^\'.*\'$ ]]; then
+        value="${value:1:${#value}-2}"
+    fi
 
-    for current_id in "${ids[@]}"; do
-        [ "$current_id" = "$expected_id" ] || break
-        expected_id=$((expected_id + 1))
-    done
-
-    echo "$expected_id"
+    printf '%s\n' "$value"
 }
 
+# 校验 MAC 地址格式
 is_valid_mac() {
     [[ "$1" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]
 }
 
+# 按约定规则生成默认基础 MAC
 get_default_base_mac() {
     local vf_id="$1"
     printf '00:66:%02X:00:00:00\n' "$((vf_id + 1))"
 }
 
+# 获取可用于 SR-IOV 的物理网卡，排除 lo、虚拟网卡和 VF
 get_available_physical_ifaces() {
     local iface
     local sysfs_path
@@ -169,14 +219,530 @@ get_available_physical_ifaces() {
     done < <(lshw -c network -businfo 2>/dev/null | awk 'NR > 1 {print $2}' | sed '/^$/d')
 }
 
+# 确保配置文件中存在 [global] 段
+ensure_global_section() {
+    ensure_config_file
+
+    if ! grep -Eq '^[[:space:]]*\[global\][[:space:]]*$' "$CONFIG_PATH"; then
+        if [ -s "$CONFIG_PATH" ]; then
+            printf '\n' >> "$CONFIG_PATH"
+        fi
+        printf '[global]\n' >> "$CONFIG_PATH"
+    fi
+}
+
+# 读取 [global] 段中的指定 key
+get_global_config_value() {
+    local key="$1"
+
+    ensure_config_file
+
+    awk -F= -v target_key="$key" '
+        /^[[:space:]]*\[global\][[:space:]]*$/ {
+            in_global = 1
+            next
+        }
+        in_global && /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            exit
+        }
+        in_global && $0 ~ "^[[:space:]]*" target_key "[[:space:]]*=" {
+            value = $0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            print value
+            exit
+        }
+    ' "$CONFIG_PATH"
+}
+
+# 根据确认方式确认当前输入
+confirm_input_value() {
+    local page_title="$1"
+    local prompt_text="$2"
+    local value="$3"
+    local confirm_mode="$4"
+    local confirm_input
+
+    case "$confirm_mode" in
+        0)
+            return 0
+            ;;
+        no)
+            read -r -p "确认“$prompt_text”的输入值为 \"$value\"，请输入 no: " confirm_input
+            subheader "$page_title"
+            [ "$confirm_input" = "no" ]
+            ;;
+        yes)
+            read -r -p "确认“$prompt_text”的输入值为 \"$value\"，请输入 yes: " confirm_input
+            subheader "$page_title"
+            [ "$confirm_input" = "yes" ]
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# 生成统一的提问提示文案
+build_prompt_label() {
+    local prompt_text="$1"
+    local options_text="$2"
+    local default_value="$3"
+    local label="$prompt_text"
+
+    if [ -n "$options_text" ]; then
+        label="$label（可选值: $options_text"
+        if [ -n "$default_value" ]; then
+            label="$label，默认值: $default_value"
+        fi
+        label="$label）"
+    elif [ -n "$default_value" ]; then
+        label="$label（默认值: $default_value）"
+    fi
+
+    printf '%s\n' "$label"
+}
+
+# 写入变量，兼容全局和局部变量名
+set_prompt_value() {
+    local var_name="$1"
+    local var_value="$2"
+
+    printf -v "$var_name" '%s' "$var_value"
+}
+
+# 处理单个结构化询问项
+prompt_config_item() {
+    local page_title="$1"
+    local prompt_text="$2"
+    local var_name="$3"
+    local options_text="$4"
+    local default_value="$5"
+    local confirm_mode="$6"
+    local prompt_label
+    local input_value
+    local selected_index
+    local option_items=()
+    local option_index
+
+    while true; do
+        prompt_label="$(build_prompt_label "$prompt_text" "$options_text" "$default_value")"
+
+        if [ -n "$options_text" ]; then
+            IFS='/' read -r -a option_items <<< "$options_text"
+            echo "[*] 可选项："
+            for option_index in "${!option_items[@]}"; do
+                printf "%d) %s\n" "$((option_index + 1))" "${option_items[$option_index]}"
+            done
+            read -r -p "$prompt_label，请输入序号: " input_value
+        else
+            read -r -p "$prompt_label: " input_value
+        fi
+        subheader "$page_title"
+
+        if [ -z "$input_value" ] && [ -n "$default_value" ]; then
+            input_value="$default_value"
+        fi
+
+        if [ -n "$options_text" ]; then
+            if [[ "$input_value" =~ ^[0-9]+$ ]]; then
+                if [ "$input_value" -lt 1 ] || [ "$input_value" -gt "${#option_items[@]}" ]; then
+                    echo "序号超出范围"
+                    continue
+                fi
+                selected_index=$((input_value - 1))
+                input_value="${option_items[$selected_index]}"
+            else
+                selected_index=-1
+                for option_index in "${!option_items[@]}"; do
+                    if [ "$input_value" = "${option_items[$option_index]}" ]; then
+                        selected_index="$option_index"
+                        break
+                    fi
+                done
+                if [ "$selected_index" -lt 0 ]; then
+                    echo "无效输入，请输入序号"
+                    continue
+                fi
+            fi
+        fi
+
+        case "$var_name" in
+            cpu_governor)
+                case "$input_value" in
+                    powersave|schedutil)
+                        ;;
+                    *)
+                        echo "[!] 无效输入，请输入 powersave 或 schedutil"
+                        continue
+                        ;;
+                esac
+                ;;
+            iface)
+                ;;
+            vf_count)
+                if ! [[ "$input_value" =~ ^[0-9]+$ ]] || [ "$input_value" -lt 1 ] || [ "$input_value" -gt "$vf_limit" ]; then
+                    echo "VF 数量无效，请输入 1 到 $vf_limit 之间的整数"
+                    continue
+                fi
+                ;;
+            tuned)
+                case "$input_value" in
+                    yes|YES|true|TRUE)
+                        input_value="true"
+                        ;;
+                    no|NO|false|FALSE)
+                        input_value="false"
+                        ;;
+                    *)
+                        echo "无效输入，请输入 true 或 false"
+                        continue
+                        ;;
+                esac
+                ;;
+            base_mac)
+                if ! is_valid_mac "$input_value"; then
+                    echo "MAC 地址格式无效，请输入类似 00:66:01:00:00:00"
+                    continue
+                fi
+                ;;
+        esac
+
+        if ! confirm_input_value "$page_title" "$prompt_text" "$input_value" "$confirm_mode"; then
+            echo "[*] 已取消本次输入，请重新填写"
+            continue
+        fi
+
+        set_prompt_value "$var_name" "$input_value"
+        return 0
+    done
+}
+
+# 按结构化列表依次处理多个询问项
+prompt_config_items() {
+    local page_title="$1"
+    local array_name="$2"
+    local item_spec
+    local prompt_text
+    local var_name
+    local options_text
+    local default_value
+    local confirm_mode
+
+    declare -n item_specs_ref="$array_name"
+
+    for item_spec in "${item_specs_ref[@]}"; do
+        IFS='|' read -r prompt_text var_name options_text default_value confirm_mode <<< "$item_spec"
+        prompt_config_item "$page_title" "$prompt_text" "$var_name" "$options_text" "$default_value" "$confirm_mode"
+    done
+}
+
+# 将结构化询问项模板中的占位符替换成当前上下文值
+build_prompt_items_from_template() {
+    local template_array_name="$1"
+    local output_array_name="$2"
+    local item_spec
+    local resolved_spec
+    local prompt_text
+    local var_name
+    local options_text
+    local default_value
+    local confirm_mode
+    local iface_options
+
+    declare -n template_ref="$template_array_name"
+    declare -n output_ref="$output_array_name"
+
+    output_ref=()
+
+    for item_spec in "${template_ref[@]}"; do
+        IFS='|' read -r prompt_text var_name options_text default_value confirm_mode <<< "$item_spec"
+        iface_options="$(join_by_slash "${ifaces[@]}")"
+
+        prompt_text="${prompt_text//__IFACE_MAX__/${#ifaces[@]}}"
+        prompt_text="${prompt_text//__VF_LIMIT__/$vf_limit}"
+        prompt_text="${prompt_text//__VF_COUNT_DEFAULT__/$vf_count_default}"
+        prompt_text="${prompt_text//__TUNED_DEFAULT__/$tuned_default}"
+        prompt_text="${prompt_text//__BASE_MAC_DEFAULT__/$base_mac_default}"
+        prompt_text="${prompt_text//__IFACE_OPTIONS__/$iface_options}"
+
+        options_text="${options_text//__IFACE_MAX__/${#ifaces[@]}}"
+        options_text="${options_text//__VF_LIMIT__/$vf_limit}"
+        options_text="${options_text//__VF_COUNT_DEFAULT__/$vf_count_default}"
+        options_text="${options_text//__TUNED_DEFAULT__/$tuned_default}"
+        options_text="${options_text//__BASE_MAC_DEFAULT__/$base_mac_default}"
+        options_text="${options_text//__IFACE_OPTIONS__/$iface_options}"
+
+        default_value="${default_value//__IFACE_MAX__/${#ifaces[@]}}"
+        default_value="${default_value//__VF_LIMIT__/$vf_limit}"
+        default_value="${default_value//__VF_COUNT_DEFAULT__/$vf_count_default}"
+        default_value="${default_value//__TUNED_DEFAULT__/$tuned_default}"
+        default_value="${default_value//__BASE_MAC_DEFAULT__/$base_mac_default}"
+        default_value="${default_value//__IFACE_OPTIONS__/$iface_options}"
+
+        resolved_spec="$prompt_text|$var_name|$options_text|$default_value|$confirm_mode"
+        output_ref+=("$resolved_spec")
+    done
+}
+
+# 从结构化数组提取变量名列表
+get_config_item_var_names() {
+    local template_array_name="$1"
+    local item_spec
+    local prompt_text
+    local var_name
+    local options_text
+    local default_value
+    local confirm_mode
+
+    declare -n template_ref="$template_array_name"
+
+    for item_spec in "${template_ref[@]}"; do
+        IFS='|' read -r prompt_text var_name options_text default_value confirm_mode <<< "$item_spec"
+        printf '%s\n' "$var_name"
+    done
+}
+
+# 写入 [global] 段中的指定 key，不影响其他 section
+set_global_config_value() {
+    local key="$1"
+    local value="$2"
+    local tmp_file
+
+    ensure_global_section
+    tmp_file="$(mktemp)"
+
+    awk -v target_key="$key" -v target_value="$value" '
+        function print_kv() {
+            print target_key "=" target_value
+            updated = 1
+        }
+        /^[[:space:]]*\[global\][[:space:]]*$/ {
+            in_global = 1
+            print
+            next
+        }
+        in_global && /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            if (!updated) {
+                print_kv()
+            }
+            in_global = 0
+            print
+            next
+        }
+        in_global && $0 ~ "^[[:space:]]*" target_key "[[:space:]]*=" {
+            if (!updated) {
+                print_kv()
+            }
+            next
+        }
+        {
+            print
+        }
+        END {
+            if (in_global && !updated) {
+                print_kv()
+            }
+        }
+    ' "$CONFIG_PATH" > "$tmp_file"
+
+    mv "$tmp_file" "$CONFIG_PATH"
+}
+
+# 读取指定 ini section 中的 key
+get_ini_section_value() {
+    local section_name="$1"
+    local key="$2"
+
+    ensure_config_file
+
+    awk -F= -v target_section="$section_name" -v target_key="$key" '
+        $0 ~ "^[[:space:]]*\\[" target_section "\\][[:space:]]*$" {
+            in_section = 1
+            next
+        }
+        in_section && /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            exit
+        }
+        in_section && $0 ~ "^[[:space:]]*" target_key "[[:space:]]*=" {
+            value = $0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            print value
+            exit
+        }
+    ' "$CONFIG_PATH"
+}
+
+# 只解析 [vf.N] 段，输出：
+# index TAB section TAB start_line TAB end_line TAB id TAB iface TAB vf_count TAB tuned TAB base_mac
+get_vf_records() {
+    awk '
+        function flush_section() {
+            if (!in_vf) {
+                return
+            }
+            print section_index "\t" section_name "\t" section_start "\t" section_end "\t" vf_id "\t" iface "\t" vf_count "\t" tuned "\t" base_mac
+        }
+        function reset_section() {
+            in_vf = 0
+            section_name = ""
+            section_start = 0
+            section_end = 0
+            vf_id = ""
+            iface = ""
+            vf_count = ""
+            tuned = ""
+            base_mac = ""
+        }
+        BEGIN {
+            section_index = 0
+            reset_section()
+        }
+        /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            if (in_vf) {
+                section_end = NR - 1
+                flush_section()
+            }
+            reset_section()
+
+            if ($0 ~ /^[[:space:]]*\[vf\.[0-9]+\][[:space:]]*$/) {
+                in_vf = 1
+                section_index++
+                section_name = $0
+                gsub(/^[[:space:]]*\[/, "", section_name)
+                gsub(/\][[:space:]]*$/, "", section_name)
+                section_start = NR
+                section_end = NR
+                vf_id = section_name
+                sub(/^vf\./, "", vf_id)
+            }
+            next
+        }
+        !in_vf {
+            next
+        }
+        {
+            section_end = NR
+
+            if ($0 ~ /^[[:space:]]*iface[[:space:]]*=/) {
+                iface = $0
+                sub(/^[[:space:]]*iface[[:space:]]*=[[:space:]]*/, "", iface)
+            } else if ($0 ~ /^[[:space:]]*vf_count[[:space:]]*=/) {
+                vf_count = $0
+                sub(/^[[:space:]]*vf_count[[:space:]]*=[[:space:]]*/, "", vf_count)
+            } else if ($0 ~ /^[[:space:]]*tuned[[:space:]]*=/) {
+                tuned = $0
+                sub(/^[[:space:]]*tuned[[:space:]]*=[[:space:]]*/, "", tuned)
+            } else if ($0 ~ /^[[:space:]]*base_mac[[:space:]]*=/) {
+                base_mac = $0
+                sub(/^[[:space:]]*base_mac[[:space:]]*=[[:space:]]*/, "", base_mac)
+            }
+        }
+        END {
+            if (in_vf) {
+                flush_section()
+            }
+        }
+    ' "$CONFIG_PATH"
+}
+
+# 获取当前可用的最小 VF id，尽量复用空缺编号
+get_next_vf_id() {
+    local ids=()
+    local expected_id=0
+    local current_id
+    local record_index
+    local record_section
+    local record_start
+    local record_end
+    local record_id
+    local record_iface
+    local record_vf_count
+    local record_tuned
+    local record_base_mac
+
+    ensure_config_file
+
+    while IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac; do
+        [ -n "$record_id" ] || continue
+        ids+=("$record_id")
+    done < <(get_vf_records)
+
+    if [ ${#ids[@]} -eq 0 ]; then
+        echo "0"
+        return 0
+    fi
+
+    mapfile -t ids < <(printf '%s\n' "${ids[@]}" | sort -n)
+
+    for current_id in "${ids[@]}"; do
+        [ "$current_id" = "$expected_id" ] || break
+        expected_id=$((expected_id + 1))
+    done
+
+    echo "$expected_id"
+}
+
+# 按固定格式构造单条 VF ini 配置块
+build_vf_block() {
+    local vf_id="$1"
+    local item_var_name
+
+    printf '[vf.%s]\n' "$vf_id"
+    printf 'iface=%s\n' "$iface"
+
+    while IFS= read -r item_var_name; do
+        [ -n "$item_var_name" ] || continue
+        printf '%s=%s\n' "$item_var_name" "${!item_var_name}"
+    done < <(get_config_item_var_names "VF_COMMON_CONFIG_ITEMS")
+}
+
+# 在配置文件末尾追加一条 VF 配置
+append_vf_block() {
+    local vf_id="$1"
+
+    ensure_config_file
+
+    if [ -s "$CONFIG_PATH" ]; then
+        printf '\n' >> "$CONFIG_PATH"
+    fi
+
+    build_vf_block "$vf_id" >> "$CONFIG_PATH"
+    printf '\n' >> "$CONFIG_PATH"
+}
+
+# 清空所有 [vf.N] 网卡配置段，保留其他 section 不变
+clear_vf_blocks() {
+    local tmp_file
+
+    ensure_config_file
+    tmp_file="$(mktemp)"
+
+    awk '
+        /^[[:space:]]*\[vf\.[0-9]+\][[:space:]]*$/ {
+            skip = 1
+            next
+        }
+        /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            skip = 0
+        }
+        !skip {
+            print
+        }
+    ' "$CONFIG_PATH" > "$tmp_file"
+
+    mv "$tmp_file" "$CONFIG_PATH"
+}
+
 # ========================
 # 功能函数（独立函数，方便扩展）
 # ========================
+# 安装配置、脚本和 systemd 服务
 install_all() {
     require_root
     subheader "安装 SR-IOV 服务"
     echo "[+] 安装 SR-IOV 服务..."
 
+    # 安装过程中的路径、清单遍历和覆盖检查变量
     local script_dir
     local item
     local src_name
@@ -189,6 +755,7 @@ install_all() {
     local created_dirs=()
     local seen_dirs=()
     local dir_exists
+    local cpu_governor
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -248,6 +815,10 @@ install_all() {
         install -m "$file_mode" "$src_path" "$dst_path"
     done
 
+    cpu_governor="$GLOBAL_CPU_GOVERNOR_DEFAULT"
+    prompt_config_items "安装 SR-IOV 服务" "GLOBAL_CONFIG_ITEMS"
+    set_global_config_value "cpu_governor" "$cpu_governor"
+
     systemctl daemon-reload
 
     if systemctl is-enabled "$SERVICE_NAME" 2>/dev/null | grep -qx "masked"; then
@@ -262,14 +833,17 @@ install_all() {
     echo "    执行脚本: $SCRIPT_PATH"
     echo "    服务文件: $SERVICE_PATH"
     echo "    已设置开机自启: $SERVICE_NAME"
+    echo "    CPU governor: $cpu_governor"
     pause
 }
 
+# 停止并卸载服务，同时删除安装产物
 uninstall_all() {
     require_root
     subheader "卸载 SR-IOV 服务"
     echo "[-] 卸载 SR-IOV 服务..."
 
+    # removed_files 用于最后汇总实际删除的文件
     local item
     local src_name
     local dst_dir
@@ -316,6 +890,7 @@ uninstall_all() {
     pause
 }
 
+# 查看当前 systemd 服务状态
 status_service() {
     subheader "服务状态"
     echo "[*] SR-IOV 服务状态："
@@ -323,10 +898,20 @@ status_service() {
     pause
 }
 
+# 查看已保存的 VF 配置，可单条查看或查看全部
 config_list() {
-    local ifaces=()
+    local records=()
     local selected_index
     local selected_choice
+    local record_index
+    local record_section
+    local record_start
+    local record_end
+    local record_id
+    local record_iface
+    local record_vf_count
+    local record_tuned
+    local record_base_mac
 
     subheader "查看网卡 VF 配置"
 
@@ -336,17 +921,18 @@ config_list() {
         return 1
     fi
 
-    mapfile -t ifaces < <(awk -F': ' '/^[[:space:]]+iface:/ {print $2}' "$CONFIG_PATH")
+    mapfile -t records < <(get_vf_records)
 
-    if [ ${#ifaces[@]} -eq 0 ]; then
+    if [ ${#records[@]} -eq 0 ]; then
         echo "配置文件中没有网卡配置"
         pause
         return 0
     fi
 
     echo "[*] 配置列表："
-    for selected_index in "${!ifaces[@]}"; do
-        printf "%d) %s\n" "$((selected_index + 1))" "${ifaces[$selected_index]}"
+    for selected_index in "${!records[@]}"; do
+        IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
+        printf "%d) %s\n" "$((selected_index + 1))" "$(strip_config_quotes "$record_iface")"
     done
     echo "a) 查看全部"
 
@@ -366,49 +952,42 @@ config_list() {
         return 1
     fi
 
-    if [ "$selected_choice" -lt 1 ] || [ "$selected_choice" -gt "${#ifaces[@]}" ]; then
+    if [ "$selected_choice" -lt 1 ] || [ "$selected_choice" -gt "${#records[@]}" ]; then
         echo "序号超出范围"
         pause
         return 1
     fi
 
-    awk -v target="$selected_choice" '
-        BEGIN {
-            block_index = 0
-            printing = 0
-        }
-        /^  - id:/ {
-            block_index++
-            printing = (block_index == target)
-        }
-        /^[^[:space:]]/ && !/^vfs:/ {
-            printing = 0
-        }
-        printing {
-            print
-        }
-    ' "$CONFIG_PATH"
+    IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$((selected_choice - 1))]}"
+    sed -n "${record_start},${record_end}p" "$CONFIG_PATH"
     echo
 
     pause
 }
 
+# 新增一条 VF 配置
 config_add() {
+    # next_id/default_base_mac 负责生成新配置的默认标识和 MAC
     local next_id
     local default_base_mac
+    local config_items=()
+
+    # 网卡选择相关变量
     local ifaces=()
     local iface_index
-    local iface_choice
     local iface
+
+    # VF 数量校验相关变量
     local max_vfs
     local vf_limit
     local vf_count
-    local tuned_choice
-    local tuned_value="true"
-    local customize_mac_choice
+    local vf_count_default="1"
+
+    # 用户输入的调优、MAC 和确认选项
+    local tuned="true"
+    local tuned_default="true"
     local base_mac
-    local confirm_choice
-    local tmp_file
+    local base_mac_default
 
     subheader "添加网卡 VF 配置"
 
@@ -424,26 +1003,8 @@ config_add() {
         return 1
     fi
 
-    echo "[*] 可选物理网卡："
-    for iface_index in "${!ifaces[@]}"; do
-        printf "%d) %s\n" "$((iface_index + 1))" "${ifaces[$iface_index]}"
-    done
-
-    read -r -p "请选择网卡序号: " iface_choice
-    subheader "添加网卡 VF 配置"
-    if ! [[ "$iface_choice" =~ ^[0-9]+$ ]]; then
-        echo "无效输入"
-        pause
-        return 1
-    fi
-
-    if [ "$iface_choice" -lt 1 ] || [ "$iface_choice" -gt "${#ifaces[@]}" ]; then
-        echo "序号超出范围"
-        pause
-        return 1
-    fi
-
-    iface="${ifaces[$((iface_choice - 1))]}"
+    build_prompt_items_from_template "VF_SELECT_CONFIG_ITEMS" "config_items"
+    prompt_config_items "添加网卡 VF 配置" "config_items"
 
     if [ ! -r "/sys/class/net/$iface/device/sriov_totalvfs" ]; then
         echo "网卡 $iface 不支持 SR-IOV 或无法读取 sriov_totalvfs"
@@ -469,82 +1030,41 @@ config_add() {
         return 1
     fi
 
-    while true; do
-        read -r -p "请输入 VF 数量 [1-$vf_limit]: " vf_count
-        subheader "添加网卡 VF 配置"
-        if [[ "$vf_count" =~ ^[0-9]+$ ]] && [ "$vf_count" -ge 1 ] && [ "$vf_count" -le "$vf_limit" ]; then
-            break
-        fi
-        echo "VF 数量无效，请输入 1 到 $vf_limit 之间的整数"
-    done
-
-    read -r -p "是否启用调优？[Y/n]: " tuned_choice
-    subheader "添加网卡 VF 配置"
-    case "$tuned_choice" in
-        n|N|no|NO)
-            tuned_value="false"
-            ;;
-        *)
-            tuned_value="true"
-            ;;
-    esac
-
     base_mac="$default_base_mac"
-    read -r -p "是否自定义基础 MAC？[y/N]: " customize_mac_choice
-    subheader "添加网卡 VF 配置"
-    case "$customize_mac_choice" in
-        y|Y|yes|YES)
-            while true; do
-                read -r -p "请输入基础 MAC: " base_mac
-                subheader "添加网卡 VF 配置"
-                if is_valid_mac "$base_mac"; then
-                    break
-                fi
-                echo "MAC 地址格式无效，请输入类似 00:66:01:00:00:00"
-            done
-            ;;
-        *)
-            ;;
-    esac
+    base_mac_default="$default_base_mac"
+    build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
+    prompt_config_items "添加网卡 VF 配置" "config_items"
 
     echo "[*] 待写入配置："
     echo "    id: $next_id"
     echo "    iface: $iface"
     echo "    vf_count: $vf_count"
-    echo "    tuned: $tuned_value"
+    echo "    tuned: $tuned"
     echo "    base_mac: $base_mac"
-    read -r -p "确认写入配置？[y/N]: " confirm_choice
-    subheader "添加网卡 VF 配置"
-
-    case "$confirm_choice" in
-        y|Y|yes|YES)
-            tmp_file="$(mktemp)"
-            cp "$CONFIG_PATH" "$tmp_file"
-            cat <<EOF >> "$tmp_file"
-  - id: $next_id
-    iface: $iface
-    vf_count: $vf_count
-    tuned: $tuned_value
-    base_mac: "$base_mac"
-EOF
-            mv "$tmp_file" "$CONFIG_PATH"
-            echo "[+] 已添加网卡配置: $iface"
-            ;;
-        *)
-            echo "[*] 已取消写入"
-            ;;
-    esac
+    append_vf_block "$next_id"
+    echo "[+] 已添加网卡配置: $iface"
 
     pause
 }
 
+# 删除单条 VF 配置，或清空全部配置
 config_del() {
-    local ifaces=()
+    local records=()
     local selected_index
     local selected_choice
     local selected_iface
     local confirm_choice
+    local record_index
+    local record_section
+    local record_start
+    local record_end
+    local record_id
+    local record_iface
+    local record_vf_count
+    local record_tuned
+    local record_base_mac
     local tmp_file
+    local total_lines
 
     subheader "删除网卡 VF 配置"
 
@@ -554,17 +1074,18 @@ config_del() {
         return 1
     fi
 
-    mapfile -t ifaces < <(awk -F': ' '/^[[:space:]]+iface:/ {print $2}' "$CONFIG_PATH")
+    mapfile -t records < <(get_vf_records)
 
-    if [ ${#ifaces[@]} -eq 0 ]; then
+    if [ ${#records[@]} -eq 0 ]; then
         echo "配置文件中没有可删除的网卡配置"
         pause
         return 0
     fi
 
     echo "[*] 当前网卡配置："
-    for selected_index in "${!ifaces[@]}"; do
-        printf "%d) %s\n" "$((selected_index + 1))" "${ifaces[$selected_index]}"
+    for selected_index in "${!records[@]}"; do
+        IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
+        printf "%d) %s\n" "$((selected_index + 1))" "$(strip_config_quotes "$record_iface")"
     done
     echo "a) 删除全部"
 
@@ -580,9 +1101,7 @@ config_del() {
             return 0
         fi
 
-        cat <<'EOF' > "$CONFIG_PATH"
-vfs:
-EOF
+        clear_vf_blocks
         echo "[-] 已删除全部网卡配置"
         pause
         return 0
@@ -594,37 +1113,27 @@ EOF
         return 1
     fi
 
-    if [ "$selected_choice" -lt 1 ] || [ "$selected_choice" -gt "${#ifaces[@]}" ]; then
+    if [ "$selected_choice" -lt 1 ] || [ "$selected_choice" -gt "${#records[@]}" ]; then
         echo "序号超出范围"
         pause
         return 1
     fi
 
     selected_index=$((selected_choice - 1))
-    selected_iface="${ifaces[$selected_index]}"
+    IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
+    selected_iface="$(strip_config_quotes "$record_iface")"
     tmp_file="$(mktemp)"
+    total_lines="$(wc -l < "$CONFIG_PATH")"
 
-    awk -v target="$selected_choice" '
-        BEGIN {
-            block_index = 0
-            in_block = 0
-            skip_block = 0
-        }
-        /^  - id:/ {
-            block_index++
-            in_block = 1
-            skip_block = (block_index == target)
-        }
-        {
-            if (!skip_block) {
-                print
-            }
-        }
-        in_block && /^[^[:space:]]/ {
-            in_block = 0
-            skip_block = 0
-        }
-    ' "$CONFIG_PATH" > "$tmp_file"
+    if [ "$record_start" -gt 1 ]; then
+        sed -n "1,$((record_start - 1))p" "$CONFIG_PATH" > "$tmp_file"
+    else
+        : > "$tmp_file"
+    fi
+
+    if [ "$record_end" -lt "$total_lines" ]; then
+        sed -n "$((record_end + 1)),\$p" "$CONFIG_PATH" >> "$tmp_file"
+    fi
 
     mv "$tmp_file" "$CONFIG_PATH"
 
@@ -632,49 +1141,60 @@ EOF
     pause
 }
 
+# 修改已有 VF 配置，并覆盖原有配置段
 config_set() {
-    local ifaces=()
-    local ids=()
+    local records=()
     local selected_index
     local selected_choice
     local selected_id
     local selected_iface
-    local start_lines=()
-    local end_lines=()
-    local current_line
     local block_start
-    local next_block_start
+    local block_end
+    local config_items=()
+
+    # 新配置输入相关变量
     local default_base_mac
     local available_ifaces=()
+    local ifaces=()
     local iface_index
-    local iface_choice
     local iface
     local max_vfs
     local vf_limit
     local vf_count
-    local tuned_choice
-    local tuned_value="true"
-    local customize_mac_choice
+    local vf_count_default
+    local tuned="true"
+    local tuned_default
     local base_mac
-    local confirm_choice
+    local base_mac_default
     local tmp_file
+    local record_index
+    local record_section
+    local record_start
+    local record_end
+    local record_id
+    local record_iface
+    local record_vf_count
+    local record_tuned
+    local record_base_mac
+    local total_lines
+    local item_var_name
+    local current_item_value
 
     subheader "修改网卡 VF 配置"
 
     ensure_config_file
+    mapfile -t records < <(get_vf_records)
 
-    mapfile -t ifaces < <(awk -F': ' '/^[[:space:]]+iface:/ {print $2}' "$CONFIG_PATH")
-    mapfile -t ids < <(awk '/^[[:space:]]+id:/ {print $2}' "$CONFIG_PATH")
-
-    if [ ${#ifaces[@]} -eq 0 ]; then
+    if [ ${#records[@]} -eq 0 ]; then
         echo "配置文件中没有可修改的网卡配置"
         pause
         return 0
     fi
 
     echo "[*] 当前网卡配置："
-    for selected_index in "${!ifaces[@]}"; do
-        printf "%d) %s\n" "$((selected_index + 1))" "${ifaces[$selected_index]}"
+    for selected_index in "${!records[@]}"; do
+        IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
+        printf "%d) %s\n" "$((selected_index + 1))" "$(strip_config_quotes "$record_iface")"
     done
 
     read -r -p "请输入要修改的序号: " selected_choice
@@ -685,16 +1205,20 @@ config_set() {
         return 1
     fi
 
-    if [ "$selected_choice" -lt 1 ] || [ "$selected_choice" -gt "${#ifaces[@]}" ]; then
+    if [ "$selected_choice" -lt 1 ] || [ "$selected_choice" -gt "${#records[@]}" ]; then
         echo "序号超出范围"
         pause
         return 1
     fi
 
     selected_index=$((selected_choice - 1))
-    selected_id="${ids[$selected_index]}"
-    selected_iface="${ifaces[$selected_index]}"
+    IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
+    selected_id="$(strip_config_quotes "$record_id")"
+    selected_iface="$(strip_config_quotes "$record_iface")"
     default_base_mac="$(get_default_base_mac "$selected_id")"
+    record_vf_count="${record_vf_count:-1}"
+    record_tuned="${record_tuned:-true}"
+    record_base_mac="${record_base_mac:-$default_base_mac}"
 
     mapfile -t available_ifaces < <(get_available_physical_ifaces)
     if [ ${#available_ifaces[@]} -eq 0 ]; then
@@ -703,26 +1227,9 @@ config_set() {
         return 1
     fi
 
-    echo "[*] 可选物理网卡："
-    for iface_index in "${!available_ifaces[@]}"; do
-        printf "%d) %s\n" "$((iface_index + 1))" "${available_ifaces[$iface_index]}"
-    done
-
-    read -r -p "请选择网卡序号: " iface_choice
-    subheader "修改网卡 VF 配置"
-    if ! [[ "$iface_choice" =~ ^[0-9]+$ ]]; then
-        echo "无效输入"
-        pause
-        return 1
-    fi
-
-    if [ "$iface_choice" -lt 1 ] || [ "$iface_choice" -gt "${#available_ifaces[@]}" ]; then
-        echo "序号超出范围"
-        pause
-        return 1
-    fi
-
-    iface="${available_ifaces[$((iface_choice - 1))]}"
+    ifaces=("${available_ifaces[@]}")
+    build_prompt_items_from_template "VF_SELECT_CONFIG_ITEMS" "config_items"
+    prompt_config_items "修改网卡 VF 配置" "config_items"
 
     if [ ! -r "/sys/class/net/$iface/device/sriov_totalvfs" ]; then
         echo "网卡 $iface 不支持 SR-IOV 或无法读取 sriov_totalvfs"
@@ -748,106 +1255,59 @@ config_set() {
         return 1
     fi
 
-    while true; do
-        read -r -p "请输入 VF 数量 [1-$vf_limit]: " vf_count
-        subheader "修改网卡 VF 配置"
-        if [[ "$vf_count" =~ ^[0-9]+$ ]] && [ "$vf_count" -ge 1 ] && [ "$vf_count" -le "$vf_limit" ]; then
-            break
+    while IFS= read -r item_var_name; do
+        [ -n "$item_var_name" ] || continue
+        current_item_value="$(get_ini_section_value "$record_section" "$item_var_name")"
+        if [ -n "$current_item_value" ]; then
+            set_prompt_value "$item_var_name" "$current_item_value"
         fi
-        echo "VF 数量无效，请输入 1 到 $vf_limit 之间的整数"
-    done
+    done < <(get_config_item_var_names "VF_COMMON_CONFIG_ITEMS")
 
-    read -r -p "是否启用调优？[Y/n]: " tuned_choice
-    subheader "修改网卡 VF 配置"
-    case "$tuned_choice" in
-        n|N|no|NO)
-            tuned_value="false"
-            ;;
-        *)
-            tuned_value="true"
-            ;;
-    esac
-
+    vf_count_default="$record_vf_count"
+    tuned_default="$record_tuned"
     base_mac="$default_base_mac"
-    read -r -p "是否自定义基础 MAC？[y/N]: " customize_mac_choice
-    subheader "修改网卡 VF 配置"
-    case "$customize_mac_choice" in
-        y|Y|yes|YES)
-            while true; do
-                read -r -p "请输入基础 MAC: " base_mac
-                subheader "修改网卡 VF 配置"
-                if is_valid_mac "$base_mac"; then
-                    break
-                fi
-                echo "MAC 地址格式无效，请输入类似 00:66:01:00:00:00"
-            done
-            ;;
-        *)
-            ;;
-    esac
+    base_mac_default="$record_base_mac"
+    build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
+    prompt_config_items "修改网卡 VF 配置" "config_items"
 
     echo "[*] 待写入配置："
     echo "    id: $selected_id"
     echo "    iface: $iface"
     echo "    vf_count: $vf_count"
-    echo "    tuned: $tuned_value"
+    echo "    tuned: $tuned"
     echo "    base_mac: $base_mac"
-    read -r -p "确认写入配置？[y/N]: " confirm_choice
-    subheader "修改网卡 VF 配置"
+    block_start="$record_start"
+    block_end="$record_end"
 
-    case "$confirm_choice" in
-        y|Y|yes|YES)
-            mapfile -t start_lines < <(grep -n '^  - id:' "$CONFIG_PATH" | cut -d: -f1)
-            block_start="${start_lines[$selected_index]}"
-            next_block_start=""
+    if [ -z "$block_start" ]; then
+        echo "[!] 未找到要修改的配置块"
+        pause
+        return 1
+    fi
 
-            if [ $((selected_index + 1)) -lt "${#start_lines[@]}" ]; then
-                next_block_start="${start_lines[$((selected_index + 1))]}"
-            fi
+    total_lines="$(wc -l < "$CONFIG_PATH")"
+    tmp_file="$(mktemp)"
 
-            if [ -z "$block_start" ]; then
-                echo "[!] 未找到要修改的配置块"
-                pause
-                return 1
-            fi
+    if [ "$block_start" -gt 1 ]; then
+        sed -n "1,$((block_start - 1))p" "$CONFIG_PATH" > "$tmp_file"
+    else
+        : > "$tmp_file"
+    fi
 
-            if [ -n "$next_block_start" ]; then
-                current_line=$((next_block_start - 1))
-            else
-                current_line="$(wc -l < "$CONFIG_PATH")"
-            fi
+    build_vf_block "$selected_id" >> "$tmp_file"
+    printf '\n' >> "$tmp_file"
 
-            tmp_file="$(mktemp)"
+    if [ "$block_end" -lt "$total_lines" ]; then
+        sed -n "$((block_end + 1)),\$p" "$CONFIG_PATH" >> "$tmp_file"
+    fi
 
-            if [ "$block_start" -gt 1 ]; then
-                sed -n "1,$((block_start - 1))p" "$CONFIG_PATH" > "$tmp_file"
-            else
-                : > "$tmp_file"
-            fi
-
-            cat <<EOF >> "$tmp_file"
-  - id: $selected_id
-    iface: $iface
-    vf_count: $vf_count
-    tuned: $tuned_value
-    base_mac: "$base_mac"
-EOF
-
-            if [ "$current_line" -lt "$(wc -l < "$CONFIG_PATH")" ]; then
-                sed -n "$((current_line + 1)),\$p" "$CONFIG_PATH" >> "$tmp_file"
-            fi
-
-            mv "$tmp_file" "$CONFIG_PATH"
-            echo "[*] 已更新网卡配置: $selected_iface -> $iface"
-            ;;
-        *)
-            echo "[*] 已取消写入"
-            ;;
-    esac
+    mv "$tmp_file" "$CONFIG_PATH"
+    echo "[*] 已更新网卡配置: $selected_iface -> $iface"
 
     pause
 }
 
+# 显示菜单帮助
 show_help() {
     subheader "帮助"
     echo "帮助信息："
@@ -859,6 +1319,7 @@ show_help() {
 # ========================
 # 配置菜单
 # ========================
+# 二级菜单：配置增删改查
 config_menu() {
     while true; do
         header
@@ -884,6 +1345,7 @@ config_menu() {
 # ========================
 # 主菜单
 # ========================
+# 程序主入口菜单
 main_menu() {
     while true; do
         header
