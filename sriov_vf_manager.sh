@@ -46,6 +46,11 @@ header() {
     echo "=============================="
 }
 
+subheader() {
+    header
+    echo "---- $1 ----"
+}
+
 install_packages() {
     local missing_packages=()
     local package_name
@@ -82,6 +87,7 @@ uninstall_packages() {
     local remove_choice
 
     read -r -p "是否同时卸载依赖软件 ${PACKAGE_ITEMS[*]}？[y/N]: " remove_choice
+    subheader "卸载 SR-IOV 服务"
     case "$remove_choice" in
         y|Y|yes|YES)
             echo "[*] 正在卸载依赖软件:"
@@ -168,6 +174,7 @@ get_available_physical_ifaces() {
 # ========================
 install_all() {
     require_root
+    subheader "安装 SR-IOV 服务"
     echo "[+] 安装 SR-IOV 服务..."
 
     local script_dir
@@ -214,9 +221,11 @@ install_all() {
     done
 
     if [ ${#existing_files[@]} -gt 0 ]; then
+        subheader "安装 SR-IOV 服务"
         echo "[!] 发现以下同名文件已存在："
         printf '    - %s\n' "${existing_files[@]}"
         read -r -p "是否覆盖这些文件？[y/N]: " overwrite_choice
+        subheader "安装 SR-IOV 服务"
         case "$overwrite_choice" in
             y|Y|yes|YES)
                 echo "[*] 将覆盖已存在文件"
@@ -258,6 +267,7 @@ install_all() {
 
 uninstall_all() {
     require_root
+    subheader "卸载 SR-IOV 服务"
     echo "[-] 卸载 SR-IOV 服务..."
 
     local item
@@ -307,6 +317,7 @@ uninstall_all() {
 }
 
 status_service() {
+    subheader "服务状态"
     echo "[*] SR-IOV 服务状态："
     systemctl status "$SERVICE_NAME" --no-pager || echo "服务未安装或未运行"
     pause
@@ -316,6 +327,8 @@ config_list() {
     local ifaces=()
     local selected_index
     local selected_choice
+
+    subheader "查看网卡 VF 配置"
 
     if [ ! -f "$CONFIG_PATH" ]; then
         echo "配置文件不存在: $CONFIG_PATH"
@@ -338,6 +351,7 @@ config_list() {
     echo "a) 查看全部"
 
     read -r -p "请输入要查看的序号: " selected_choice
+    subheader "查看网卡 VF 配置"
 
     if [ "$selected_choice" = "a" ] || [ "$selected_choice" = "A" ]; then
         cat "$CONFIG_PATH"
@@ -396,6 +410,8 @@ config_add() {
     local confirm_choice
     local tmp_file
 
+    subheader "添加网卡 VF 配置"
+
     ensure_config_file
 
     next_id="$(get_next_vf_id)"
@@ -414,6 +430,7 @@ config_add() {
     done
 
     read -r -p "请选择网卡序号: " iface_choice
+    subheader "添加网卡 VF 配置"
     if ! [[ "$iface_choice" =~ ^[0-9]+$ ]]; then
         echo "无效输入"
         pause
@@ -454,6 +471,7 @@ config_add() {
 
     while true; do
         read -r -p "请输入 VF 数量 [1-$vf_limit]: " vf_count
+        subheader "添加网卡 VF 配置"
         if [[ "$vf_count" =~ ^[0-9]+$ ]] && [ "$vf_count" -ge 1 ] && [ "$vf_count" -le "$vf_limit" ]; then
             break
         fi
@@ -461,6 +479,7 @@ config_add() {
     done
 
     read -r -p "是否启用调优？[Y/n]: " tuned_choice
+    subheader "添加网卡 VF 配置"
     case "$tuned_choice" in
         n|N|no|NO)
             tuned_value="false"
@@ -472,10 +491,12 @@ config_add() {
 
     base_mac="$default_base_mac"
     read -r -p "是否自定义基础 MAC？[y/N]: " customize_mac_choice
+    subheader "添加网卡 VF 配置"
     case "$customize_mac_choice" in
         y|Y|yes|YES)
             while true; do
                 read -r -p "请输入基础 MAC: " base_mac
+                subheader "添加网卡 VF 配置"
                 if is_valid_mac "$base_mac"; then
                     break
                 fi
@@ -493,6 +514,7 @@ config_add() {
     echo "    tuned: $tuned_value"
     echo "    base_mac: $base_mac"
     read -r -p "确认写入配置？[y/N]: " confirm_choice
+    subheader "添加网卡 VF 配置"
 
     case "$confirm_choice" in
         y|Y|yes|YES)
@@ -524,6 +546,8 @@ config_del() {
     local confirm_choice
     local tmp_file
 
+    subheader "删除网卡 VF 配置"
+
     if [ ! -f "$CONFIG_PATH" ]; then
         echo "配置文件不存在: $CONFIG_PATH"
         pause
@@ -545,9 +569,11 @@ config_del() {
     echo "a) 删除全部"
 
     read -r -p "请输入要删除的序号: " selected_choice
+    subheader "删除网卡 VF 配置"
 
     if [ "$selected_choice" = "a" ] || [ "$selected_choice" = "A" ]; then
         read -r -p "将删除全部网卡配置，确认请输入 yes: " confirm_choice
+        subheader "删除网卡 VF 配置"
         if [ "$confirm_choice" != "yes" ]; then
             echo "[*] 已取消删除"
             pause
@@ -633,6 +659,8 @@ config_set() {
     local confirm_choice
     local tmp_file
 
+    subheader "修改网卡 VF 配置"
+
     ensure_config_file
 
     mapfile -t ifaces < <(awk -F': ' '/^[[:space:]]+iface:/ {print $2}' "$CONFIG_PATH")
@@ -650,6 +678,7 @@ config_set() {
     done
 
     read -r -p "请输入要修改的序号: " selected_choice
+    subheader "修改网卡 VF 配置"
     if ! [[ "$selected_choice" =~ ^[0-9]+$ ]]; then
         echo "无效输入"
         pause
@@ -680,6 +709,7 @@ config_set() {
     done
 
     read -r -p "请选择网卡序号: " iface_choice
+    subheader "修改网卡 VF 配置"
     if ! [[ "$iface_choice" =~ ^[0-9]+$ ]]; then
         echo "无效输入"
         pause
@@ -720,6 +750,7 @@ config_set() {
 
     while true; do
         read -r -p "请输入 VF 数量 [1-$vf_limit]: " vf_count
+        subheader "修改网卡 VF 配置"
         if [[ "$vf_count" =~ ^[0-9]+$ ]] && [ "$vf_count" -ge 1 ] && [ "$vf_count" -le "$vf_limit" ]; then
             break
         fi
@@ -727,6 +758,7 @@ config_set() {
     done
 
     read -r -p "是否启用调优？[Y/n]: " tuned_choice
+    subheader "修改网卡 VF 配置"
     case "$tuned_choice" in
         n|N|no|NO)
             tuned_value="false"
@@ -738,10 +770,12 @@ config_set() {
 
     base_mac="$default_base_mac"
     read -r -p "是否自定义基础 MAC？[y/N]: " customize_mac_choice
+    subheader "修改网卡 VF 配置"
     case "$customize_mac_choice" in
         y|Y|yes|YES)
             while true; do
                 read -r -p "请输入基础 MAC: " base_mac
+                subheader "修改网卡 VF 配置"
                 if is_valid_mac "$base_mac"; then
                     break
                 fi
@@ -759,6 +793,7 @@ config_set() {
     echo "    tuned: $tuned_value"
     echo "    base_mac: $base_mac"
     read -r -p "确认写入配置？[y/N]: " confirm_choice
+    subheader "修改网卡 VF 配置"
 
     case "$confirm_choice" in
         y|Y|yes|YES)
@@ -814,6 +849,7 @@ EOF
 }
 
 show_help() {
+    subheader "帮助"
     echo "帮助信息："
     echo "选择对应数字操作 SR-IOV 服务"
     echo "安装、卸载、查看服务状态、配置增删改查"
