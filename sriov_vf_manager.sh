@@ -40,6 +40,8 @@ GLOBAL_CONFIG_ITEMS=(
     "请选择 CPU governor，用于 cpupower 设置|cpu_governor|powersave/schedutil|powersave|0"
 )
 
+BACK_SIGNAL="__BACK__"
+
 # 结构化网卡配置询问项：
 # 提示文本|变量名|可选项列表|默认值|确认方式(0|no|yes)
 VF_SELECT_CONFIG_ITEMS=(
@@ -333,11 +335,17 @@ prompt_config_item() {
             for option_index in "${!option_items[@]}"; do
                 printf "%d) %s\n" "$((option_index + 1))" "${option_items[$option_index]}"
             done
+            echo "b) 返回"
             read -r -p "$prompt_label，请输入序号: " input_value
         else
+            echo "b) 返回"
             read -r -p "$prompt_label: " input_value
         fi
         subheader "$page_title"
+
+        if [ "$input_value" = "b" ] || [ "$input_value" = "B" ]; then
+            return 1
+        fi
 
         if [ -z "$input_value" ] && [ -n "$default_value" ]; then
             input_value="$default_value"
@@ -432,7 +440,9 @@ prompt_config_items() {
 
     for item_spec in "${item_specs_ref[@]}"; do
         IFS='|' read -r prompt_text var_name options_text default_value confirm_mode <<< "$item_spec"
-        prompt_config_item "$page_title" "$prompt_text" "$var_name" "$options_text" "$default_value" "$confirm_mode"
+        if ! prompt_config_item "$page_title" "$prompt_text" "$var_name" "$options_text" "$default_value" "$confirm_mode"; then
+            return 1
+        fi
     done
 }
 
@@ -935,6 +945,7 @@ config_list() {
         printf "%d) %s\n" "$((selected_index + 1))" "$(strip_config_quotes "$record_iface")"
     done
     echo "a) 查看全部"
+    echo "b) 返回"
 
     read -r -p "请输入要查看的序号: " selected_choice
     subheader "查看网卡 VF 配置"
@@ -943,6 +954,10 @@ config_list() {
         cat "$CONFIG_PATH"
         echo
         pause
+        return 0
+    fi
+
+    if [ "$selected_choice" = "b" ] || [ "$selected_choice" = "B" ]; then
         return 0
     fi
 
@@ -1004,7 +1019,9 @@ config_add() {
     fi
 
     build_prompt_items_from_template "VF_SELECT_CONFIG_ITEMS" "config_items"
-    prompt_config_items "添加网卡 VF 配置" "config_items"
+    if ! prompt_config_items "添加网卡 VF 配置" "config_items"; then
+        return 0
+    fi
 
     if [ ! -r "/sys/class/net/$iface/device/sriov_totalvfs" ]; then
         echo "网卡 $iface 不支持 SR-IOV 或无法读取 sriov_totalvfs"
@@ -1033,7 +1050,9 @@ config_add() {
     base_mac="$default_base_mac"
     base_mac_default="$default_base_mac"
     build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
-    prompt_config_items "添加网卡 VF 配置" "config_items"
+    if ! prompt_config_items "添加网卡 VF 配置" "config_items"; then
+        return 0
+    fi
 
     echo "[*] 待写入配置："
     echo "    id: $next_id"
@@ -1088,6 +1107,7 @@ config_del() {
         printf "%d) %s\n" "$((selected_index + 1))" "$(strip_config_quotes "$record_iface")"
     done
     echo "a) 删除全部"
+    echo "b) 返回"
 
     read -r -p "请输入要删除的序号: " selected_choice
     subheader "删除网卡 VF 配置"
@@ -1104,6 +1124,10 @@ config_del() {
         clear_vf_blocks
         echo "[-] 已删除全部网卡配置"
         pause
+        return 0
+    fi
+
+    if [ "$selected_choice" = "b" ] || [ "$selected_choice" = "B" ]; then
         return 0
     fi
 
@@ -1196,9 +1220,13 @@ config_set() {
         IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
         printf "%d) %s\n" "$((selected_index + 1))" "$(strip_config_quotes "$record_iface")"
     done
+    echo "b) 返回"
 
     read -r -p "请输入要修改的序号: " selected_choice
     subheader "修改网卡 VF 配置"
+    if [ "$selected_choice" = "b" ] || [ "$selected_choice" = "B" ]; then
+        return 0
+    fi
     if ! [[ "$selected_choice" =~ ^[0-9]+$ ]]; then
         echo "无效输入"
         pause
@@ -1229,7 +1257,9 @@ config_set() {
 
     ifaces=("${available_ifaces[@]}")
     build_prompt_items_from_template "VF_SELECT_CONFIG_ITEMS" "config_items"
-    prompt_config_items "修改网卡 VF 配置" "config_items"
+    if ! prompt_config_items "修改网卡 VF 配置" "config_items"; then
+        return 0
+    fi
 
     if [ ! -r "/sys/class/net/$iface/device/sriov_totalvfs" ]; then
         echo "网卡 $iface 不支持 SR-IOV 或无法读取 sriov_totalvfs"
@@ -1268,7 +1298,9 @@ config_set() {
     base_mac="$default_base_mac"
     base_mac_default="$record_base_mac"
     build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
-    prompt_config_items "修改网卡 VF 配置" "config_items"
+    if ! prompt_config_items "修改网卡 VF 配置" "config_items"; then
+        return 0
+    fi
 
     echo "[*] 待写入配置："
     echo "    id: $selected_id"
