@@ -1,0 +1,16 @@
+[Unit]
+Description=PVE Network & OVS Performance Tune
+DefaultDependencies=no
+Before=pve-guests.service
+After=network.target
+Wants=network.target
+#After=network.target openvswitch-switch.service
+#Wants=openvswitch-switch.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sriov_vf.sh
+RemainAfterExit=true
+  
+[Install]
+WantedBy=multi-user.target
