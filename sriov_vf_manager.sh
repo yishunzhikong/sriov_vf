@@ -200,11 +200,14 @@ get_default_base_mac() {
 get_available_physical_ifaces() {
     local iface
     local sysfs_path
+    local businfo_ifaces=()
 
     if ! command -v lshw >/dev/null 2>&1; then
         echo "[!] 未找到 lshw，请先执行安装功能安装依赖" >&2
         return 1
     fi
+
+    mapfile -t businfo_ifaces < <(lshw -c network -businfo 2>/dev/null | awk 'NR > 1 {print $2}' | sed '/^$/d')
 
     while read -r iface; do
         [ -n "$iface" ] || continue
@@ -215,10 +218,10 @@ get_available_physical_ifaces() {
         [[ "$sysfs_path" == *"/devices/virtual/net/"* ]] && continue
         [ -L "/sys/class/net/$iface/device/physfn" ] && continue
 
-        if lshw -c network -businfo 2>/dev/null | awk 'NR > 1 {print $2}' | grep -Fxq "$iface"; then
+        if printf '%s\n' "${businfo_ifaces[@]}" | grep -Fxq "$iface"; then
             printf '%s\n' "$iface"
         fi
-    done < <(lshw -c network -businfo 2>/dev/null | awk 'NR > 1 {print $2}' | sed '/^$/d')
+    done < <(printf '%s\n' "${businfo_ifaces[@]}")
 }
 
 # 确保配置文件中存在 [global] 段
