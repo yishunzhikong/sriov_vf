@@ -1342,8 +1342,6 @@ config_set() {
     pause
 }
 
-
-
 # 显示菜单帮助
 show_help() {
     subheader "帮助"
