@@ -47,8 +47,8 @@ VF_SELECT_CONFIG_ITEMS=(
 )
 
 VF_COMMON_CONFIG_ITEMS=(
-    "请输入 VF 数量|vf_count||__VF_COUNT_DEFAULT__|0"
-    "是否启用调优|tuned|true/false|__TUNED_DEFAULT__|0"
+    "请输入 VF 数量|vf_count||8|0"
+    "是否启用调优|tuned|true/false|true|0"
     "请输入基础 MAC|base_mac||__BASE_MAC_DEFAULT__|0"
 )
 
