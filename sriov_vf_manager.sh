@@ -833,7 +833,6 @@ config_menu() {
         echo "4) 修改网卡 VF 配置"
         echo "b) 返回主菜单"
         read -p "请选择: " choice
-        
 
         case $choice in
             1) config_list ;;
