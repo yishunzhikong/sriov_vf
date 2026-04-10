@@ -49,7 +49,7 @@ VF_SELECT_CONFIG_ITEMS=(
 )
 
 VF_COMMON_CONFIG_ITEMS=(
-    "请输入 VF 数量|vf_count||8|0"
+    "请输入 VF 数量（当前网卡最多可创建 __VF_LIMIT__ 个）|vf_count||8|0"
     "是否启用调优|tuned|true/false|true|0"
     "请输入基础 MAC|base_mac||__BASE_MAC_DEFAULT__|0"
 )
@@ -194,6 +194,24 @@ is_valid_mac() {
 get_default_base_mac() {
     local vf_id="$1"
     printf '00:66:%02X:00:00:00\n' "$((vf_id + 1))"
+}
+
+# 读取网卡可创建的最大 VF 数量
+get_iface_total_vfs() {
+    local iface="$1"
+    local total_vfs_path="/sys/class/net/$iface/device/sriov_totalvfs"
+    local total_vfs
+
+    if [ ! -r "$total_vfs_path" ]; then
+        return 1
+    fi
+
+    total_vfs="$(cat "$total_vfs_path")"
+    if ! [[ "$total_vfs" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$total_vfs"
 }
 
 # 获取可用于 SR-IOV 的物理网卡，排除 lo、虚拟网卡和 VF
@@ -746,6 +764,26 @@ clear_vf_blocks() {
     mv "$tmp_file" "$CONFIG_PATH"
 }
 
+# 配置文件变更后重载服务，使新配置立即生效
+reload_managed_service() {
+    require_root
+
+    systemctl daemon-reload
+
+    if ! systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${SERVICE_NAME}[[:space:]]"; then
+        echo "[*] 服务 $SERVICE_NAME 尚未安装，已跳过重载"
+        return 0
+    fi
+
+    echo "[*] 正在重新加载服务: $SERVICE_NAME"
+    if ! systemctl restart "$SERVICE_NAME"; then
+        echo "[!] 服务重载失败，请执行 systemctl status $SERVICE_NAME 查看详情"
+        return 1
+    fi
+
+    echo "[+] 服务已重新加载"
+}
+
 # ========================
 # 功能函数（独立函数，方便扩展）
 # ========================
@@ -1026,15 +1064,8 @@ config_add() {
         return 0
     fi
 
-    if [ ! -r "/sys/class/net/$iface/device/sriov_totalvfs" ]; then
+    if ! max_vfs="$(get_iface_total_vfs "$iface")"; then
         echo "网卡 $iface 不支持 SR-IOV 或无法读取 sriov_totalvfs"
-        pause
-        return 1
-    fi
-
-    max_vfs="$(cat "/sys/class/net/$iface/device/sriov_totalvfs")"
-    if ! [[ "$max_vfs" =~ ^[0-9]+$ ]]; then
-        echo "无法读取网卡 $iface 的 VF 上限"
         pause
         return 1
     fi
@@ -1050,6 +1081,9 @@ config_add() {
         return 1
     fi
 
+    echo "[*] 网卡 $iface 最多可创建 $max_vfs 个 VF"
+    [ "$vf_limit" != "$max_vfs" ] && echo "[*] 当前工具允许填写的最大值为 $vf_limit"
+
     base_mac="$default_base_mac"
     base_mac_default="$default_base_mac"
     build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
@@ -1064,6 +1098,7 @@ config_add() {
     echo "    tuned: $tuned"
     echo "    base_mac: $base_mac"
     append_vf_block "$next_id"
+    reload_managed_service
     echo "[+] 已添加网卡配置: $iface"
 
     pause
@@ -1125,6 +1160,7 @@ config_del() {
         fi
 
         clear_vf_blocks
+        reload_managed_service
         echo "[-] 已删除全部网卡配置"
         pause
         return 0
@@ -1164,6 +1200,7 @@ config_del() {
 
     mv "$tmp_file" "$CONFIG_PATH"
 
+    reload_managed_service
     echo "[-] 已删除网卡配置: $selected_iface"
     pause
 }
@@ -1264,15 +1301,8 @@ config_set() {
         return 0
     fi
 
-    if [ ! -r "/sys/class/net/$iface/device/sriov_totalvfs" ]; then
+    if ! max_vfs="$(get_iface_total_vfs "$iface")"; then
         echo "网卡 $iface 不支持 SR-IOV 或无法读取 sriov_totalvfs"
-        pause
-        return 1
-    fi
-
-    max_vfs="$(cat "/sys/class/net/$iface/device/sriov_totalvfs")"
-    if ! [[ "$max_vfs" =~ ^[0-9]+$ ]]; then
-        echo "无法读取网卡 $iface 的 VF 上限"
         pause
         return 1
     fi
@@ -1287,6 +1317,9 @@ config_set() {
         pause
         return 1
     fi
+
+    echo "[*] 网卡 $iface 最多可创建 $max_vfs 个 VF"
+    [ "$vf_limit" != "$max_vfs" ] && echo "[*] 当前工具允许填写的最大值为 $vf_limit"
 
     while IFS= read -r item_var_name; do
         [ -n "$item_var_name" ] || continue
@@ -1337,6 +1370,7 @@ config_set() {
     fi
 
     mv "$tmp_file" "$CONFIG_PATH"
+    reload_managed_service
     echo "[*] 已更新网卡配置: $selected_iface -> $iface"
 
     pause
