@@ -51,6 +51,7 @@ VF_SELECT_CONFIG_ITEMS=(
 VF_COMMON_CONFIG_ITEMS=(
     "请输入 VF 数量（当前网卡最多可创建 __VF_LIMIT__ 个）|vf_count||8|0"
     "是否启用调优|tuned|true/false|true|0"
+    "设置MAC第一位防止冲突|base_mac_hander||00|0"
     "请输入基础 MAC|base_mac||__BASE_MAC_DEFAULT__|0"
 )
 
