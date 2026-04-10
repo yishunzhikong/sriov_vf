@@ -191,10 +191,17 @@ is_valid_mac() {
     [[ "$1" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]
 }
 
+# 校验 MAC 单个字节格式
+is_valid_mac_octet() {
+    [[ "$1" =~ ^[[:xdigit:]]{2}$ ]]
+}
+
 # 按约定规则生成默认基础 MAC
 get_default_base_mac() {
     local vf_id="$1"
-    printf '00:66:%02X:00:00:00\n' "$((vf_id + 1))"
+    local base_mac_hander="${2:-00}"
+
+    printf '%s:66:%02X:00:00:00\n' "$base_mac_hander" "$((vf_id + 1))"
 }
 
 # 读取网卡可创建的最大 VF 数量
@@ -434,6 +441,13 @@ prompt_config_item() {
                     echo "MAC 地址格式无效，请输入类似 00:66:01:00:00:00"
                     continue
                 fi
+                ;;
+            base_mac_hander)
+                if ! is_valid_mac_octet "$input_value"; then
+                    echo "MAC 第一位格式无效，请输入两位十六进制，例如 00"
+                    continue
+                fi
+                input_value="${input_value^^}"
                 ;;
         esac
 
@@ -1043,6 +1057,8 @@ config_add() {
     # 用户输入的调优、MAC 和确认选项
     local tuned="true"
     local tuned_default="true"
+    local base_mac_hander="00"
+    local base_mac_hander_default="00"
     local base_mac
     local base_mac_default
 
@@ -1051,8 +1067,6 @@ config_add() {
     ensure_config_file
 
     next_id="$(get_next_vf_id)"
-    default_base_mac="$(get_default_base_mac "$next_id")"
-
     mapfile -t ifaces < <(get_available_physical_ifaces)
     if [ ${#ifaces[@]} -eq 0 ]; then
         echo "未找到可配置的物理网卡"
@@ -1085,10 +1099,20 @@ config_add() {
     echo "[*] 网卡 $iface 最多可创建 $max_vfs 个 VF"
     [ "$vf_limit" != "$max_vfs" ] && echo "[*] 当前工具允许填写的最大值为 $vf_limit"
 
+    if ! prompt_config_item "添加网卡 VF 配置" "请输入 VF 数量（当前网卡最多可创建 $vf_limit 个）" "vf_count" "" "$vf_count_default" "0"; then
+        return 0
+    fi
+    if ! prompt_config_item "添加网卡 VF 配置" "是否启用调优" "tuned" "true/false" "$tuned_default" "0"; then
+        return 0
+    fi
+    if ! prompt_config_item "添加网卡 VF 配置" "设置MAC第一位防止冲突" "base_mac_hander" "" "$base_mac_hander_default" "0"; then
+        return 0
+    fi
+
+    default_base_mac="$(get_default_base_mac "$next_id" "$base_mac_hander")"
     base_mac="$default_base_mac"
     base_mac_default="$default_base_mac"
-    build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
-    if ! prompt_config_items "添加网卡 VF 配置" "config_items"; then
+    if ! prompt_config_item "添加网卡 VF 配置" "请输入基础 MAC" "base_mac" "" "$base_mac_default" "0"; then
         return 0
     fi
 
@@ -1229,6 +1253,8 @@ config_set() {
     local vf_count_default
     local tuned="true"
     local tuned_default
+    local base_mac_hander="00"
+    local base_mac_hander_default="00"
     local base_mac
     local base_mac_default
     local tmp_file
@@ -1284,7 +1310,7 @@ config_set() {
     IFS=$'\t' read -r record_index record_section record_start record_end record_id record_iface record_vf_count record_tuned record_base_mac <<< "${records[$selected_index]}"
     selected_id="$(strip_config_quotes "$record_id")"
     selected_iface="$(strip_config_quotes "$record_iface")"
-    default_base_mac="$(get_default_base_mac "$selected_id")"
+    default_base_mac="$(get_default_base_mac "$selected_id" "$base_mac_hander")"
     record_vf_count="${record_vf_count:-1}"
     record_tuned="${record_tuned:-true}"
     record_base_mac="${record_base_mac:-$default_base_mac}"
@@ -1332,10 +1358,22 @@ config_set() {
 
     vf_count_default="$record_vf_count"
     tuned_default="$record_tuned"
+    base_mac_hander_default="${base_mac_hander:-00}"
+
+    if ! prompt_config_item "修改网卡 VF 配置" "请输入 VF 数量（当前网卡最多可创建 $vf_limit 个）" "vf_count" "" "$vf_count_default" "0"; then
+        return 0
+    fi
+    if ! prompt_config_item "修改网卡 VF 配置" "是否启用调优" "tuned" "true/false" "$tuned_default" "0"; then
+        return 0
+    fi
+    if ! prompt_config_item "修改网卡 VF 配置" "设置MAC第一位防止冲突" "base_mac_hander" "" "$base_mac_hander_default" "0"; then
+        return 0
+    fi
+
+    default_base_mac="$(get_default_base_mac "$selected_id" "$base_mac_hander")"
     base_mac="$default_base_mac"
-    base_mac_default="$record_base_mac"
-    build_prompt_items_from_template "VF_COMMON_CONFIG_ITEMS" "config_items"
-    if ! prompt_config_items "修改网卡 VF 配置" "config_items"; then
+    base_mac_default="${record_base_mac:-$default_base_mac}"
+    if ! prompt_config_item "修改网卡 VF 配置" "请输入基础 MAC" "base_mac" "" "$base_mac_default" "0"; then
         return 0
     fi
 
